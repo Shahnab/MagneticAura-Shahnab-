@@ -1,0 +1,6 @@
+{
+  "name": "Magnetic Aura Tracking",
+  "description": "Real-time physics tracking where fluid magnetic particles track your bodily contour.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
