@@ -863,16 +863,19 @@ export default function App() {
 
   const startRecording = () => {
     if (!canvasRef.current) return;
-    
+
     recordedChunksRef.current = [];
     const stream = canvasRef.current.captureStream(30);
-    
+
+    // Prefer native MP4 (Safari/WebKit). Fall back to WebM on Chrome/Firefox.
+    const mp4Types = ['video/mp4; codecs=avc1', 'video/mp4'];
+    const webmTypes = ['video/webm; codecs=vp9', 'video/webm; codecs=vp8', 'video/webm'];
+    const preferredType = [...mp4Types, ...webmTypes].find(t => MediaRecorder.isTypeSupported(t)) || '';
+    const isMp4 = preferredType.startsWith('video/mp4');
+
     try {
-      mediaRecorderRef.current = new MediaRecorder(stream, {
-        mimeType: 'video/webm; codecs=vp9'
-      });
+      mediaRecorderRef.current = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
     } catch (e) {
-      // Fallback for browsers that don't support vp9
       mediaRecorderRef.current = new MediaRecorder(stream);
     }
 
@@ -884,14 +887,14 @@ export default function App() {
 
     mediaRecorderRef.current.onstop = () => {
       const blob = new Blob(recordedChunksRef.current, {
-        type: 'video/webm'
+        type: isMp4 ? 'video/mp4' : 'video/webm'
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       document.body.appendChild(a);
       a.style.display = 'none';
       a.href = url;
-      a.download = `quantum-pose-${Date.now()}.webm`;
+      a.download = `magnetic-aura-${Date.now()}.${isMp4 ? 'mp4' : 'webm'}`;
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
