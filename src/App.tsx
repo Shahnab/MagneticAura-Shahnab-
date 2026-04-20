@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Square, Loader2, Camera as CameraIcon, Play, Zap, Palette, Film } from 'lucide-react';
+import { Square, Loader2, Camera as CameraIcon, Play, Zap, Palette, Film, PersonStanding } from 'lucide-react';
 
 const BODY_BONES = [
   { p: [11, 13], r: 0.16, w: 1.5 }, { p: [13, 15], r: 0.12, w: 1.2 }, // L arm
@@ -60,6 +60,14 @@ export default function App() {
     setNormalVideoBg(normalVideoBgRef.current);
   };
 
+  const [showSkeleton, setShowSkeleton] = useState(true);
+  const showSkeletonRef = useRef(true);
+
+  const toggleShowSkeleton = () => {
+    showSkeletonRef.current = !showSkeletonRef.current;
+    setShowSkeleton(showSkeletonRef.current);
+  };
+
   const [spreadMultiplier, setSpreadMultiplier] = useState(1.0);
   const spreadMultiplierRef = useRef(1.0);
 
@@ -72,6 +80,7 @@ export default function App() {
   const uploadedVideoUrlRef = useRef<string | null>(null);
   const shouldMirrorRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const bgVideoRef = useRef<HTMLVideoElement>(null);
 
   const toggleCamera = () => {
     showCameraRef.current = !showCameraRef.current;
@@ -237,6 +246,12 @@ export default function App() {
       videoRef.current.src = '';
       videoRef.current.load();
     }
+
+    if (bgVideoRef.current && bgVideoRef.current.src) {
+      bgVideoRef.current.pause();
+      bgVideoRef.current.src = '';
+      bgVideoRef.current.load();
+    }
     
     // Clear canvas and restore default resolution
     if (canvasRef.current) {
@@ -293,6 +308,15 @@ export default function App() {
           canvasRef.current.height = videoRef.current.videoHeight;
         }
         await videoRef.current.play();
+      }
+
+      // Background fill video — same source, muted, loops in sync
+      if (bgVideoRef.current) {
+        bgVideoRef.current.src = url;
+        bgVideoRef.current.loop = true;
+        bgVideoRef.current.muted = true;
+        bgVideoRef.current.playsInline = true;
+        await bgVideoRef.current.play();
       }
 
       const Holistic = (window as any).Holistic;
@@ -693,6 +717,45 @@ export default function App() {
                     canvasCtx.drawImage(pCanvas, 0, 0, W, H);
                 }
             }
+
+            // Skeleton overlay on top of aura when toggled
+            if (showSkeletonRef.current) {
+                if (results.poseLandmarks && drawConnectors && drawLandmarks && POSE_CONNECTIONS) {
+                    drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS,
+                                   {color: 'rgba(255, 255, 255, 0.35)', lineWidth: 2});
+                    const sp = results.poseLandmarks;
+                    canvasCtx.beginPath();
+                    canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+                    canvasCtx.lineWidth = 1;
+                    const dtl = (a: number, b: number) => {
+                        const l1 = sp[a]; const l2 = sp[b];
+                        if (l1 && l2 && (l1.visibility ?? 1) > 0.5 && (l2.visibility ?? 1) > 0.5 && canvasRef.current) {
+                            canvasCtx.moveTo(l1.x * canvasRef.current.width, l1.y * canvasRef.current.height);
+                            canvasCtx.lineTo(l2.x * canvasRef.current.width, l2.y * canvasRef.current.height);
+                        }
+                    };
+                    dtl(11,24); dtl(12,23); dtl(15,12); dtl(16,11); dtl(13,23); dtl(14,24);
+                    canvasCtx.stroke();
+                    drawLandmarks(canvasCtx, results.poseLandmarks,
+                                  {color: 'rgba(255, 255, 255, 0.7)', fillColor: '#000000', lineWidth: 1.5, radius: 3});
+                }
+                if (results.faceLandmarks && drawConnectors && FACEMESH_TESSELATION) {
+                    drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_TESSELATION,
+                                   {color: 'rgba(255, 255, 255, 0.08)', lineWidth: 0.5});
+                    if (FACEMESH_RIGHT_EYE) drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_RIGHT_EYE, {color: 'rgba(255,255,255,0.35)', lineWidth: 1});
+                    if (FACEMESH_LEFT_EYE) drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_LEFT_EYE, {color: 'rgba(255,255,255,0.35)', lineWidth: 1});
+                    if (FACEMESH_FACE_OVAL) drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_FACE_OVAL, {color: 'rgba(255,255,255,0.25)', lineWidth: 1.5});
+                    if (FACEMESH_LIPS) drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_LIPS, {color: 'rgba(255,255,255,0.35)', lineWidth: 1});
+                }
+                if (results.leftHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
+                    drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, {color: 'rgba(255,255,255,0.5)', lineWidth: 1.5});
+                    drawLandmarks(canvasCtx, results.leftHandLandmarks, {color: 'rgba(255,255,255,1)', fillColor: '#000000', lineWidth: 1, radius: 2});
+                }
+                if (results.rightHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
+                    drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, {color: 'rgba(255,255,255,0.5)', lineWidth: 1.5});
+                    drawLandmarks(canvasCtx, results.rightHandLandmarks, {color: 'rgba(255,255,255,1)', fillColor: '#000000', lineWidth: 1, radius: 2});
+                }
+            }
         }
       canvasCtx.restore();
       return;
@@ -718,7 +781,7 @@ export default function App() {
     }
     
     // Draw Pose
-    if (results.poseLandmarks && drawConnectors && drawLandmarks && POSE_CONNECTIONS) {
+    if (showSkeletonRef.current && results.poseLandmarks && drawConnectors && drawLandmarks && POSE_CONNECTIONS) {
       drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS,
                      {color: 'rgba(255, 255, 255, 0.4)', lineWidth: 2});
       
@@ -753,7 +816,7 @@ export default function App() {
     }
 
     // Draw Face
-    if (results.faceLandmarks && drawConnectors && FACEMESH_TESSELATION) {
+    if (showSkeletonRef.current && results.faceLandmarks && drawConnectors && FACEMESH_TESSELATION) {
       // Draw the dense interconnected mesh
       drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_TESSELATION,
                      {color: 'rgba(255, 255, 255, 0.1)', lineWidth: 0.5});
@@ -772,7 +835,7 @@ export default function App() {
     }
 
     // Draw Left Hand
-    if (results.leftHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
+    if (showSkeletonRef.current && results.leftHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
       drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS,
                      {color: 'rgba(255, 255, 255, 0.6)', lineWidth: 1.5});
       drawLandmarks(canvasCtx, results.leftHandLandmarks,
@@ -780,7 +843,7 @@ export default function App() {
     }
 
     // Draw Right Hand
-    if (results.rightHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
+    if (showSkeletonRef.current && results.rightHandLandmarks && drawConnectors && drawLandmarks && HAND_CONNECTIONS) {
       drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS,
                      {color: 'rgba(255, 255, 255, 0.6)', lineWidth: 1.5});
       drawLandmarks(canvasCtx, results.rightHandLandmarks,
@@ -854,6 +917,21 @@ export default function App() {
         playsInline 
       />
 
+      {/* Background fill — blurred video frame covers the full UI when aspect ratio leaves gaps */}
+      <video
+        ref={bgVideoRef}
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{
+          filter: 'blur(32px) brightness(55%) saturate(130%)',
+          transform: 'scale(1.1)',
+          zIndex: 0,
+          display: isVideoMode ? 'block' : 'none',
+        }}
+        playsInline
+        muted
+        loop
+      />
+
       {/* Hidden file input for video upload */}
       <input
         ref={fileInputRef}
@@ -868,7 +946,7 @@ export default function App() {
       />
 
       {/* Main Canvas */}
-      <div className="absolute inset-0 flex items-center justify-center">
+      <div className="absolute inset-0 flex items-center justify-center" style={{ zIndex: 1 }}>
         <canvas
           ref={canvasRef}
           width={1280}
@@ -1004,6 +1082,20 @@ export default function App() {
             </button>
 
             <div className="w-px h-4 bg-white/10 mx-1" />
+
+            {/* Skeleton mode button */}
+            <button
+              onClick={toggleShowSkeleton}
+              disabled={!isLoaded}
+              title={showSkeleton ? 'Hide Skeleton' : 'Show Skeleton'}
+              className={`flex items-center justify-center w-8 h-8 border transition-all duration-300 ${
+                showSkeleton
+                  ? 'border-cyan-500/60 text-cyan-400'
+                  : 'border-white/15 text-white/40 hover:border-white/30 hover:text-white/70'
+              } disabled:opacity-20 disabled:cursor-not-allowed`}
+            >
+              <PersonStanding className={`w-3.5 h-3.5 ${showSkeleton ? 'fill-cyan-400' : ''} transition-all duration-300`} />
+            </button>
 
             {/* Aura mode button */}
             <button
