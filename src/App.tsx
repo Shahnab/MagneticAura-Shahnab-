@@ -922,7 +922,7 @@ export default function App() {
         ref={bgVideoRef}
         className="absolute inset-0 w-full h-full object-cover"
         style={{
-          filter: 'blur(32px) brightness(55%) saturate(130%)',
+          filter: 'grayscale(100%) blur(32px) brightness(55%)',
           transform: 'scale(1.1)',
           zIndex: 0,
           display: isVideoMode ? 'block' : 'none',
