@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Square, Loader2, Camera as CameraIcon, Play, Zap } from 'lucide-react';
+import { Square, Loader2, Camera as CameraIcon, Play, Zap, Palette, Film } from 'lucide-react';
 
 const BODY_BONES = [
   { p: [11, 13], r: 0.16, w: 1.5 }, { p: [13, 15], r: 0.12, w: 1.2 }, // L arm
@@ -10,6 +10,22 @@ const BODY_BONES = [
   { p: [11, 12], r: 0.28, w: 1.5 }, { p: [23, 24], r: 0.28, w: 1.5 }, // Torso top/bot
   { p: [8, 7], r: 0.35, w: 2.5 }                                      // Head (Ear to Ear)
 ];
+
+// For each symmetric bone, maps to its mirror bone and the partner landmark indices.
+// Used to detect side-view occlusion: when both bones overlap in 2D, whichever is
+// further from the camera (higher z) gets its particles suppressed.
+const BONE_PARTNER: Record<number, { partner: number; myIds: number[]; pIds: number[] }> = {
+  0: { partner: 2, myIds: [11, 13], pIds: [12, 14] }, // L upper arm  <-> R upper arm
+  2: { partner: 0, myIds: [12, 14], pIds: [11, 13] },
+  1: { partner: 3, myIds: [13, 15], pIds: [14, 16] }, // L lower arm  <-> R lower arm
+  3: { partner: 1, myIds: [14, 16], pIds: [13, 15] },
+  4: { partner: 6, myIds: [23, 25], pIds: [24, 26] }, // L upper leg  <-> R upper leg
+  6: { partner: 4, myIds: [24, 26], pIds: [23, 25] },
+  5: { partner: 7, myIds: [25, 27], pIds: [26, 28] }, // L lower leg  <-> R lower leg
+  7: { partner: 5, myIds: [26, 28], pIds: [25, 27] },
+  8: { partner: 9, myIds: [11, 23], pIds: [12, 24] }, // L torso side <-> R torso side
+  9: { partner: 8, myIds: [12, 24], pIds: [11, 23] },
+};
 
 export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -22,9 +38,40 @@ export default function App() {
   const isAuraModeRef = useRef(false);
   const [isAuraMode, setIsAuraMode] = useState(false);
   const poseLmsRef = useRef<any>(null);
+  const smoothedPoseLmsRef = useRef<any[]>([]);
+  const smoothedRefScaleRef = useRef(0.2);
   
   const [showCamera, setShowCamera] = useState(true);
   const showCameraRef = useRef(true);
+
+  const [colorSegmentation, setColorSegmentation] = useState(true);
+  const colorSegmentationRef = useRef(true);
+
+  const toggleColorSegmentation = () => {
+    colorSegmentationRef.current = !colorSegmentationRef.current;
+    setColorSegmentation(colorSegmentationRef.current);
+  };
+
+  const [normalVideoBg, setNormalVideoBg] = useState(false);
+  const normalVideoBgRef = useRef(false);
+
+  const toggleNormalVideoBg = () => {
+    normalVideoBgRef.current = !normalVideoBgRef.current;
+    setNormalVideoBg(normalVideoBgRef.current);
+  };
+
+  const [spreadMultiplier, setSpreadMultiplier] = useState(1.0);
+  const spreadMultiplierRef = useRef(1.0);
+
+  const [volume, setVolume] = useState(0.8);
+  const volumeRef = useRef(0.8);
+
+  const [isVideoMode, setIsVideoMode] = useState(false);
+  const isVideoModeRef = useRef(false);
+  const [uploadedVideoName, setUploadedVideoName] = useState<string | null>(null);
+  const uploadedVideoUrlRef = useRef<string | null>(null);
+  const shouldMirrorRef = useRef(true);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const toggleCamera = () => {
     showCameraRef.current = !showCameraRef.current;
@@ -33,16 +80,18 @@ export default function App() {
   
   const particlesRef = useRef<any[]>([]);
   const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const personCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
     maskCanvasRef.current = document.createElement('canvas');
+    personCanvasRef.current = document.createElement('canvas');
   }, []);
 
   useEffect(() => {
     const pts: any[] = [];
     const totalWeight = BODY_BONES.reduce((sum, b) => sum + b.w, 0);
 
-    for (let i = 0; i < 3360; i++) {
+    for (let i = 0; i < 5500; i++) {
       let rand = Math.random() * totalWeight;
       let bIdx = 0;
       for (let j = 0; j < BODY_BONES.length; j++) {
@@ -52,9 +101,10 @@ export default function App() {
       pts.push({
         b: bIdx,
         t: Math.random(),
-        ang: Math.random() * Math.PI * 2, // 2D spread around the bone
+        ang: Math.random() * Math.PI * 2,
+        phi: Math.acos(1 - 2 * Math.random()), // elevation angle for uniform 3D sphere distribution
         dist: 0,
-        randDist: Math.random(), // Clean 0 to 1 distribution for clustering
+        randDist: Math.random(),
         x: 0, y: 0, vx: 0, vy: 0, angle: 0, hist: [], active: false
       });
     }
@@ -101,13 +151,13 @@ export default function App() {
       });
 
       holistic.setOptions({
-        modelComplexity: 0, // 0 prioritizes speed and real-time performance to eliminate lag
+        modelComplexity: 1, // Balanced accuracy – noticeably better side-view landmark placement
         smoothLandmarks: true,
         enableSegmentation: true, // Needed to cleanly separate user from background aura
         smoothSegmentation: true,
         refineFaceLandmarks: true, // Guarantees detailed tracking of fingers and face
-        minDetectionConfidence: 0.65,
-        minTrackingConfidence: 0.65
+        minDetectionConfidence: 0.5, // Lower so tracking survives partial side-on occlusion
+        minTrackingConfidence: 0.5
       });
 
       holistic.onResults(onResults);
@@ -154,6 +204,16 @@ export default function App() {
     hasStartedRef.current = false;
     setHasStarted(false);
     setIsLoaded(false);
+    isVideoModeRef.current = false;
+    setIsVideoMode(false);
+    shouldMirrorRef.current = true;
+    setUploadedVideoName(null);
+    smoothedPoseLmsRef.current = [];
+
+    if (uploadedVideoUrlRef.current) {
+      URL.revokeObjectURL(uploadedVideoUrlRef.current);
+      uploadedVideoUrlRef.current = null;
+    }
     
     if (cameraRef.current) {
       cameraRef.current.stop();
@@ -171,13 +231,103 @@ export default function App() {
       stream.getTracks().forEach(track => track.stop());
       videoRef.current.srcObject = null;
     }
+
+    if (videoRef.current && videoRef.current.src) {
+      videoRef.current.pause();
+      videoRef.current.src = '';
+      videoRef.current.load();
+    }
     
-    // Clear canvas safely
+    // Clear canvas and restore default resolution
     if (canvasRef.current) {
         const ctx = canvasRef.current.getContext('2d');
         if (ctx) {
             ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
         }
+        canvasRef.current.width = 1280;
+        canvasRef.current.height = 720;
+    }
+  };
+
+  const initVideoMode = async (file: File) => {
+    // Stop any active session first
+    if (hasStartedRef.current) {
+      stopHardwareCamera();
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    setHasStarted(true);
+    hasStartedRef.current = true;
+    isVideoModeRef.current = true;
+    setIsVideoMode(true);
+    shouldMirrorRef.current = false; // Video plays as-is, no mirror
+    setUploadedVideoName(file.name);
+    setError(null);
+
+    try {
+      let retries = 0;
+      while (!(window as any).Holistic && retries < 50) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        retries++;
+      }
+      if (!(window as any).Holistic) throw new Error('Failed to load MediaPipe Holistic');
+
+      const url = URL.createObjectURL(file);
+      uploadedVideoUrlRef.current = url;
+
+      if (videoRef.current) {
+        videoRef.current.src = url;
+        videoRef.current.loop = true;
+        videoRef.current.muted = false;
+        videoRef.current.volume = volumeRef.current;
+        videoRef.current.playsInline = true;
+        // Wait for metadata so we know the real dimensions before playing
+        await new Promise<void>(resolve => {
+          const vid = videoRef.current!;
+          if (vid.readyState >= 1) { resolve(); return; }
+          vid.onloadedmetadata = () => resolve();
+        });
+        // Resize canvas to match video's native aspect ratio — no stretching
+        if (canvasRef.current && videoRef.current.videoWidth && videoRef.current.videoHeight) {
+          canvasRef.current.width = videoRef.current.videoWidth;
+          canvasRef.current.height = videoRef.current.videoHeight;
+        }
+        await videoRef.current.play();
+      }
+
+      const Holistic = (window as any).Holistic;
+      const holistic = new Holistic({
+        locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${f}`
+      });
+      holistic.setOptions({
+        modelComplexity: 1,          // Higher accuracy for pre-recorded video
+        smoothLandmarks: true,
+        enableSegmentation: true,
+        smoothSegmentation: true,
+        refineFaceLandmarks: true,
+        minDetectionConfidence: 0.5,  // Lower to survive partial occlusion & camera shake
+        minTrackingConfidence: 0.5
+      });
+      holistic.onResults(onResults);
+      holisticRef.current = holistic;
+
+      const processFrame = async () => {
+        if (!hasStartedRef.current) return;
+        if (videoRef.current && videoRef.current.readyState >= 2 && !videoRef.current.paused) {
+          await holistic.send({ image: videoRef.current });
+        }
+        requestAnimationFrame(processFrame);
+      };
+      requestAnimationFrame(processFrame);
+      setIsLoaded(true);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'Failed to process video.');
+      setHasStarted(false);
+      hasStartedRef.current = false;
+      isVideoModeRef.current = false;
+      setIsVideoMode(false);
+      shouldMirrorRef.current = true;
     }
   };
 
@@ -201,15 +351,32 @@ export default function App() {
     canvasCtx.save();
     canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
     
-    // Flip the canvas horizontally to create a mirror effect
-    canvasCtx.translate(canvasRef.current.width, 0);
-    canvasCtx.scale(-1, 1);
+    // Flip the canvas horizontally for camera (mirror effect); skip for uploaded video
+    if (shouldMirrorRef.current) {
+      canvasCtx.translate(canvasRef.current.width, 0);
+      canvasCtx.scale(-1, 1);
+    }
 
     // Render video or black background
     if (showCameraRef.current) {
-        canvasCtx.filter = 'grayscale(100%) contrast(110%) brightness(85%)';
-        canvasCtx.drawImage(results.image, 0, 0, canvasRef.current.width, canvasRef.current.height);
-        canvasCtx.filter = 'none';
+        if (isAuraModeRef.current && normalVideoBgRef.current) {
+            // Normal video + particles: draw full-color video, slightly dimmed for particle contrast
+            canvasCtx.filter = 'brightness(80%) contrast(105%)';
+            canvasCtx.drawImage(results.image, 0, 0, canvasRef.current.width, canvasRef.current.height);
+            canvasCtx.filter = 'none';
+        } else if (isVideoModeRef.current && isAuraModeRef.current) {
+            // Video + aura: crush background to near-black so golden threads blaze against it
+            canvasCtx.filter = 'grayscale(100%) contrast(160%) brightness(18%)';
+            canvasCtx.drawImage(results.image, 0, 0, canvasRef.current.width, canvasRef.current.height);
+            canvasCtx.filter = 'none';
+            // Additional atmospheric dark veil
+            canvasCtx.fillStyle = 'rgba(0, 0, 0, 0.40)';
+            canvasCtx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        } else {
+            canvasCtx.filter = 'grayscale(100%) contrast(110%) brightness(85%)';
+            canvasCtx.drawImage(results.image, 0, 0, canvasRef.current.width, canvasRef.current.height);
+            canvasCtx.filter = 'none';
+        }
     } else {
         canvasCtx.fillStyle = '#0f0f11';
         canvasCtx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
@@ -218,9 +385,28 @@ export default function App() {
     // Hide all 2D skeleton drawing and run particle physics when Fluid Aura is active
     if (isAuraModeRef.current) {
         if (results.poseLandmarks) {
-            const pLms = results.poseLandmarks;
+            let pLms = results.poseLandmarks;
             const W = canvasRef.current.width;
             const H = canvasRef.current.height;
+
+            // Temporally smooth landmarks for BOTH camera and video modes.
+            // Camera (alpha=0.28): heavy smoothing absorbs jitter from side-view detection noise.
+            // Video  (alpha=0.45): lighter smoothing preserves crisp motion in pre-recorded content.
+            const alpha = isVideoModeRef.current ? 0.45 : 0.28;
+            if (smoothedPoseLmsRef.current.length !== pLms.length) {
+                smoothedPoseLmsRef.current = pLms.map((lm: any) => ({ ...lm }));
+            } else {
+                for (let i = 0; i < pLms.length; i++) {
+                    const raw = pLms[i];
+                    const s = smoothedPoseLmsRef.current[i];
+                    s.x += (raw.x - s.x) * alpha;
+                    s.y += (raw.y - s.y) * alpha;
+                    s.z  = (s.z  || 0) + ((raw.z  || 0) - (s.z  || 0)) * alpha;
+                    const rv = raw.visibility ?? 1;
+                    s.visibility = (s.visibility ?? rv) + (rv - (s.visibility ?? rv)) * 0.3;
+                }
+            }
+            pLms = smoothedPoseLmsRef.current;
             
             const shoulder1 = pLms[11];
             const shoulder2 = pLms[12];
@@ -243,6 +429,11 @@ export default function App() {
                 const dy = shoulder1.y - shoulder2.y;
                 refScale = Math.sqrt(dx*dx + dy*dy);
             }
+            // EMA-smooth refScale so scale changes glide rather than snap.
+            // Faster blend in video mode; slower in camera mode to absorb detection jitter.
+            const rsAlpha = isVideoModeRef.current ? 0.30 : 0.18;
+            smoothedRefScaleRef.current += (refScale - smoothedRefScaleRef.current) * rsAlpha;
+            refScale = smoothedRefScaleRef.current;
             
             const time = Date.now() * 0.001;
             
@@ -251,10 +442,50 @@ export default function App() {
                const p1 = pLms[bone.p[0]];
                const p2 = pLms[bone.p[1]];
                
-               if (!p1 || !p2 || p1.visibility < 0.2 || p2.visibility < 0.2) {
-                   p.active = false;
-                   p.hist = []; // Clear history immediately to prevent ghost trails
-                   return;
+               if (!p1 || !p2) { p.active = false; p.hist = []; return; }
+
+               // --- Depth-occlusion suppression for side views ---
+               // When two symmetric limbs (e.g. left/right leg) overlap in 2D screen space
+               // because the body is turned sideways, we use the z-depth reported by MediaPipe
+               // to determine which is the "back" limb and gradually suppress its particles.
+               // This prevents the characteristic side-view oscillation where particles
+               // visibly jump back and forth between the front and back leg.
+               let depthTarget = 1.0;
+               const pairInfo = BONE_PARTNER[p.b];
+               if (pairInfo) {
+                   const pp1 = pLms[pairInfo.pIds[0]];
+                   const pp2 = pLms[pairInfo.pIds[1]];
+                   if (pp1 && pp2) {
+                       const myMidX  = (p1.x + p2.x) / 2;
+                       const pMidX   = (pp1.x + pp2.x) / 2;
+                       const myMidZ  = ((p1.z || 0) + (p2.z || 0)) / 2;
+                       const pMidZ   = ((pp1.z || 0) + (pp2.z || 0)) / 2;
+                       // xOverlap rises from 0 (frontal view) to 1 (fully side-on) based on
+                       // how close the two bones are horizontally in normalized screen coords.
+                       const xOverlap = Math.max(0, 1 - Math.abs(myMidX - pMidX) / 0.12);
+                       if (xOverlap > 0.25 && myMidZ > pMidZ) {
+                           // This bone is behind its partner. Scale suppression by both
+                           // the overlap amount and the z-separation so it fades smoothly.
+                           const zDiff = Math.min(1, (myMidZ - pMidZ) * 25);
+                           depthTarget = 1 - xOverlap * zDiff * 0.92;
+                       }
+                   }
+               }
+               // EMA-smooth the suppression value so transitions are gradual, not instant.
+               if (p.depthSup === undefined) p.depthSup = 1.0;
+               p.depthSup += (depthTarget - p.depthSup) * 0.15;
+
+               // Smooth visibility per-particle with hysteresis to prevent flicker.
+               // Use a slower blend for live camera so particles don't flicker when
+               // a landmark briefly dips below threshold during side-on turns.
+               const rawVis = Math.min(p1.visibility ?? 1, p2.visibility ?? 1) * p.depthSup;
+               if (p.vis === undefined) p.vis = rawVis;
+               p.vis += (rawVis - p.vis) * (isVideoModeRef.current ? 0.18 : 0.30);
+               // Hysteresis: lower thresholds so particles survive partial side-on occlusion.
+               const onThresh  = p.active ? 0.06 : 0.14;
+               if (p.vis < onThresh) {
+                   if (!p.active) return;
+                   p.active = false; p.hist = []; return;
                }
                p.active = true;
                
@@ -264,9 +495,9 @@ export default function App() {
                const dx = p2x - p1x; const dy = p2y - p1y;
                // Bump base thickness outwards slightly so trails clearly trace the exact camera contour 
                // instead of clipping under the segmentation mask
-               const baseThickness = bone.w * refScale * W * 0.23;
+               const baseThickness = bone.w * refScale * W * 0.23 * spreadMultiplierRef.current;
                // Minimal spread so particles sit tightly right on the exterior edges
-               const auraSpread = refScale * W * 0.15; 
+               const auraSpread = refScale * W * 0.15 * spreadMultiplierRef.current;
                
                // Soft taper at bone ends
                const taper = Math.sin(p.t * Math.PI);
@@ -278,19 +509,28 @@ export default function App() {
                
                const rRadius = actualThickness + distFromSkin;
                
-               let tx = p1x + dx * p.t + Math.cos(p.ang) * rRadius;
-               let ty = p1y + dy * p.t + Math.sin(p.ang) * rRadius;
+               // 3D spherical distribution: ang = azimuth, phi = elevation (uniform sphere)
+               const sinPhi3d = Math.sin(p.phi);
+               const cosPhi3d = Math.cos(p.phi);
+               // Screen-plane (XY) spread via spherical coords
+               const off3dX = Math.cos(p.ang) * sinPhi3d * rRadius;
+               const off3dY = Math.sin(p.ang) * sinPhi3d * rRadius;
+               // Depth (Z) component projected to 2D via isometric offset — creates wrap-around 3D illusion
+               const depth3d = cosPhi3d * rRadius;
+               let tx = p1x + dx * p.t + off3dX + depth3d * 0.20;
+               let ty = p1y + dy * p.t + off3dY + depth3d * 0.38;
                
                // Movement Delta calculation for Dynamic Trailing
                const distToTarget = Math.hypot(tx - p.x, ty - p.y);
                
-               // Safe, ultra-smooth fast tracking
-               // Highly responsive interpolation for glued-on real-time sync without lag
-               p.x += (tx - p.x) * 0.85;
-               p.y += (ty - p.y) * 0.85;
+               // Adaptive lerp: landmark targets are now smoothed in both modes, so camera
+               // no longer needs the aggressive 0.85 snap — 0.70 gives fluid following.
+               const lerpFactor = isVideoModeRef.current ? 0.55 : 0.70;
+               p.x += (tx - p.x) * lerpFactor;
+               p.y += (ty - p.y) * lerpFactor;
                
-               // Perfect radial "Iron Filings" orientation (No artificial wind swaying)
-               const targetAngle = p.ang;
+               // Orientation follows the projected 2D direction of the 3D radial offset
+               const targetAngle = Math.atan2(off3dY + depth3d * 0.38, off3dX + depth3d * 0.20);
                
                let aDiff = targetAngle - p.angle;
                while (aDiff > Math.PI) aDiff -= Math.PI * 2;
@@ -305,8 +545,8 @@ export default function App() {
                
                // Creative Redesign: Pulsating elegant energy flares instead of static flat sticks
                const pulse = Math.sin(time * 6 + normalizedDist * 100) * 0.5 + 0.5;
-               const baseStickLen = refScale * W * 0.015 + (1.0 - normalizedDist) * refScale * W * 0.02; 
-               const stickLen = baseStickLen * (0.4 + 0.6 * pulse); // Scintillate
+               const baseStickLen = refScale * W * 0.011 + (1.0 - normalizedDist) * refScale * W * 0.013; 
+               const stickLen = baseStickLen * (0.55 + 0.45 * pulse); // Scintillate
                
                p.stickLen = stickLen;
                
@@ -315,7 +555,7 @@ export default function App() {
                // If the user actively moves, draw trailing comets. Otherwise, shrink back to iron filings.
                if (distToTarget > W * 0.003) {
                    p.hist.push({x: p.x, y: p.y, angle: p.angle, len: stickLen});
-                   if (p.hist.length > 3) p.hist.shift();
+                   if (p.hist.length > 3) p.hist.shift(); // Short tail = tight crisp comets
                } else {
                    // Standing still: gracefully melt the trail history
                    if (p.hist.length > 0) p.hist.shift();
@@ -339,7 +579,7 @@ export default function App() {
                         // Supreme glitch guard: if any particle moves impossibly far between frames, skip rendering its trail entirely.
                         let glitchDetected = false;
                         for (let j = 1; j < p.hist.length; j++) {
-                            if (Math.hypot(p.hist[j].x - p.hist[j-1].x, p.hist[j].y - p.hist[j-1].y) > 50) {
+                            if (Math.hypot(p.hist[j].x - p.hist[j-1].x, p.hist[j].y - p.hist[j-1].y) > Math.max(50, W * 0.07)) {
                                 glitchDetected = true;
                                 break;
                             }
@@ -379,43 +619,102 @@ export default function App() {
             };
             
             if (particlesRef.current.length > 0) {
-                // Sharper, highly-creative fiery plasma palette (No murky over-blooming)
-                // Wide ambient heat
-                drawTrails(10.0, 'rgba(255, 75, 10, 0.05)');
+                const inVideoAura = isVideoModeRef.current;
+                // Soft outer glow halo
+                drawTrails(inVideoAura ? 10.0 : 7.0, inVideoAura ? 'rgba(255, 75, 10, 0.07)' : 'rgba(255, 75, 10, 0.03)');
                 
-                // Tight energetic amber structure
-                drawTrails(2.5, 'rgba(255, 150, 20, 0.35)');
+                // Core amber threads — toned down so they don't blow out
+                drawTrails(2.0, inVideoAura ? 'rgba(255, 150, 20, 0.42)' : 'rgba(255, 140, 20, 0.22)');
                 
-                // Razor-fine white-hot filament tips
-                drawTrails(0.8, 'rgba(255, 255, 255, 0.9)');
+                // Fine filament tips — reduced from 0.9 to keep whites subtle
+                drawTrails(0.7, 'rgba(255, 255, 255, 0.55)');
+
+                // Delicate golden rim — video only
+                if (inVideoAura) {
+                    drawTrails(1.2, 'rgba(255, 200, 70, 0.28)');
+                }
             }
             
-            // To strictly ensure NO THREADS overlap the user
-            if (results.segmentationMask && maskCanvasRef.current) {
+            // Render the person cutout on top of aura threads with crisp, HD edges.
+            if (results.segmentationMask && maskCanvasRef.current && personCanvasRef.current) {
                 const mCanvas = maskCanvasRef.current;
-                mCanvas.width = W; 
-                mCanvas.height = H;
+                const pCanvas = personCanvasRef.current;
+                mCanvas.width = W; mCanvas.height = H;
+                pCanvas.width = W; pCanvas.height = H;
+
                 const mCtx = mCanvas.getContext('2d');
-                if (mCtx) {
+                const pCtx = pCanvas.getContext('2d');
+                if (mCtx && pCtx) {
+
+                    // ── Stage 1: Build a clean, anti-aliased alpha mask ──────────────────
+                    // Upscale the (potentially low-res) mask with high-quality interpolation.
+                    // blur(5px) softens blocky pixel edges into a gradient;
+                    // contrast(28) then snaps that gradient back to near-binary BUT with
+                    // smooth sub-pixel transitions AND slight inward erosion — erasing the
+                    // ambiguous boundary pixels that were picking up background color.
+                    // brightness(1.2) brightens the mask interior so detection holes fill in.
                     mCtx.clearRect(0, 0, W, H);
+                    mCtx.imageSmoothingEnabled = true;
+                    (mCtx as any).imageSmoothingQuality = 'high';
+                    mCtx.filter = 'blur(5px) contrast(28) brightness(1.2)';
                     mCtx.drawImage(results.segmentationMask, 0, 0, W, H);
-                    
-                    mCtx.globalCompositeOperation = 'source-in';
+                    mCtx.filter = 'none';
+
+                    // ── Stage 2: Draw color-treated person, then stamp mask as alpha ──────
+                    // Draw the full-resolution image FIRST (color filters applied here,
+                    // before clipping) so filter processing never touches edge alpha pixels.
+                    pCtx.clearRect(0, 0, W, H);
+                    pCtx.imageSmoothingEnabled = true;
+                    (pCtx as any).imageSmoothingQuality = 'high';
+
                     if (showCameraRef.current) {
-                        // User in full actual color, contrasting with the black/white background
-                        mCtx.drawImage(results.image, 0, 0, W, H);
+                        const colorFilter = colorSegmentationRef.current
+                            ? (isVideoModeRef.current
+                                ? 'saturate(200%) brightness(112%) contrast(112%)'
+                                : 'saturate(170%) brightness(108%) contrast(108%)')
+                            : 'grayscale(100%) brightness(118%) contrast(128%)';
+                        pCtx.filter = colorFilter;
+                        pCtx.drawImage(results.image, 0, 0, W, H);
+                        pCtx.filter = 'none';
                     } else {
-                        mCtx.fillStyle = '#0f0f11';
-                        mCtx.fillRect(0, 0, W, H);
+                        pCtx.fillStyle = colorSegmentationRef.current
+                            ? 'rgba(130, 130, 155, 0.80)'
+                            : 'rgba(160, 160, 160, 0.75)';
+                        pCtx.fillRect(0, 0, W, H);
                     }
-                    mCtx.globalCompositeOperation = 'source-over';
-                    
-                    canvasCtx.drawImage(mCanvas, 0, 0, W, H);
+
+                    // Use destination-in to mask out the background:
+                    // pixels on personCanvas are kept only where mCanvas (the mask) is opaque.
+                    // Critically this happens AFTER color processing, so filter bleed is impossible.
+                    pCtx.globalCompositeOperation = 'destination-in';
+                    pCtx.drawImage(mCanvas, 0, 0, W, H);
+                    pCtx.globalCompositeOperation = 'source-over';
+
+                    canvasCtx.drawImage(pCanvas, 0, 0, W, H);
                 }
             }
         }
       canvasCtx.restore();
       return;
+    }
+
+    // Grey body silhouette in hide-video + normal skeleton mode
+    if (!showCameraRef.current && results.segmentationMask && maskCanvasRef.current && canvasRef.current) {
+      const sW = canvasRef.current.width;
+      const sH = canvasRef.current.height;
+      const mCanvas = maskCanvasRef.current;
+      mCanvas.width = sW;
+      mCanvas.height = sH;
+      const mCtx = mCanvas.getContext('2d');
+      if (mCtx) {
+        mCtx.clearRect(0, 0, sW, sH);
+        mCtx.drawImage(results.segmentationMask, 0, 0, sW, sH);
+        mCtx.globalCompositeOperation = 'source-in';
+        mCtx.fillStyle = 'rgba(110, 110, 130, 0.65)';
+        mCtx.fillRect(0, 0, sW, sH);
+        mCtx.globalCompositeOperation = 'source-over';
+        canvasCtx.drawImage(mCanvas, 0, 0, sW, sH);
+      }
     }
     
     // Draw Pose
@@ -553,7 +852,19 @@ export default function App() {
         ref={videoRef} 
         className="hidden" 
         playsInline 
-        muted 
+      />
+
+      {/* Hidden file input for video upload */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="video/*"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) initVideoMode(file);
+          e.target.value = '';
+        }}
       />
 
       {/* Main Canvas */}
@@ -562,7 +873,11 @@ export default function App() {
           ref={canvasRef}
           width={1280}
           height={720}
-          className="w-full h-full object-cover opacity-90"
+          className="opacity-90"
+          style={isVideoMode
+            ? { width: 'auto', height: 'auto', maxWidth: '100%', maxHeight: '100%' }
+            : { width: '100%', height: '100%', objectFit: 'cover' }
+          }
         />
       </div>
 
@@ -597,14 +912,24 @@ export default function App() {
         {!hasStarted && !error && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black z-20 pointer-events-auto">
             <div className="text-center max-w-xs px-6">
-              <h2 className="text-xs tracking-[0.25em] uppercase text-white/50 mb-6">Camera Required</h2>
-              <button 
-                onClick={initMediaPipe}
-                className="inline-flex items-center justify-center gap-2.5 px-6 py-3 border border-white/20 text-white text-xs tracking-[0.2em] uppercase hover:border-white/50 hover:bg-white/5 transition-all duration-200"
-              >
-                <Play className="w-3 h-3 fill-white" />
-                Start
-              </button>
+              <h2 className="text-xs tracking-[0.25em] uppercase text-white/50 mb-7">Choose Input</h2>
+              <div className="flex items-center gap-3 justify-center">
+                <button 
+                  onClick={initMediaPipe}
+                  className="inline-flex items-center justify-center gap-2.5 px-6 py-3 border border-white/20 text-white text-xs tracking-[0.2em] uppercase hover:border-white/50 hover:bg-white/5 transition-all duration-200"
+                >
+                  <Play className="w-3 h-3 fill-white" />
+                  Camera
+                </button>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex items-center justify-center gap-2.5 px-6 py-3 border border-white/20 text-white text-xs tracking-[0.2em] uppercase hover:border-white/50 hover:bg-white/5 transition-all duration-200"
+                  title="Upload a video file"
+                >
+                  <span className="text-sm leading-none">+</span>
+                  Video
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -705,10 +1030,110 @@ export default function App() {
             >
               <CameraIcon className="w-3.5 h-3.5" />
             </button>
+
+            {/* Color / B&W segmentation toggle */}
+            <button
+              onClick={toggleColorSegmentation}
+              disabled={!isLoaded || !isAuraMode}
+              title={colorSegmentation ? 'Switch to Black & White' : 'Switch to Color'}
+              className={`flex items-center justify-center w-8 h-8 border transition-all duration-300 ${
+                colorSegmentation
+                  ? 'border-violet-500/60 text-violet-400'
+                  : 'border-white/15 text-white/40 hover:border-white/30 hover:text-white/70'
+              } disabled:opacity-20 disabled:cursor-not-allowed`}
+            >
+              <Palette className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Normal video + particles toggle */}
+            <button
+              onClick={toggleNormalVideoBg}
+              disabled={!isLoaded || !isAuraMode}
+              title={normalVideoBg ? 'Dark Background Mode' : 'Normal Video + Particles'}
+              className={`flex items-center justify-center w-8 h-8 border transition-all duration-300 ${
+                normalVideoBg
+                  ? 'border-emerald-500/60 text-emerald-400'
+                  : 'border-white/15 text-white/40 hover:border-white/30 hover:text-white/70'
+              } disabled:opacity-20 disabled:cursor-not-allowed`}
+            >
+              <Film className="w-3.5 h-3.5" />
+            </button>
+
+            <div className="w-px h-4 bg-white/10 mx-1" />
+
+            {/* Upload video button */}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              title={isVideoMode && uploadedVideoName ? `Video: ${uploadedVideoName}` : 'Upload Video'}
+              className={`flex items-center justify-center w-8 h-8 border transition-all duration-300 ${
+                isVideoMode
+                  ? 'border-sky-500/60 text-sky-400'
+                  : 'border-white/15 text-white/40 hover:border-white/30 hover:text-white/70'
+              }`}
+            >
+              <span className="text-base leading-none font-light">+</span>
+            </button>
           </div>
 
-          {/* Bottom Right: Signature */}
-          <div className="text-right">
+          {/* Bottom Right: Signature + sliders */}
+          <div className="text-right flex flex-col items-end gap-2">
+            {/* Volume slider — only visible in video mode */}
+            {isVideoMode && isLoaded && (
+              <div className="flex items-center gap-2 pointer-events-auto">
+                <span className="text-[9px] tracking-[0.18em] uppercase text-white/25 select-none">Vol</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.02}
+                  value={volume}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    volumeRef.current = v;
+                    setVolume(v);
+                    if (videoRef.current) videoRef.current.volume = v;
+                  }}
+                  className="w-24 h-0.5 appearance-none bg-white/10 rounded-full outline-none cursor-pointer
+                    [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-2.5 [&::-webkit-slider-thumb]:h-2.5
+                    [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-sky-400
+                    [&::-webkit-slider-thumb]:border-0 [&::-webkit-slider-thumb]:cursor-pointer
+                    [&::-moz-range-thumb]:w-2.5 [&::-moz-range-thumb]:h-2.5
+                    [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-sky-400
+                    [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer"
+                />
+                <span className="text-[9px] font-mono text-white/25 w-6 text-left select-none">
+                  {Math.round(volume * 100)}%
+                </span>
+              </div>
+            )}
+            {/* Particle spread slider — only visible in aura mode */}
+            {isAuraMode && isLoaded && (
+              <div className="flex items-center gap-2 pointer-events-auto">
+                <span className="text-[9px] tracking-[0.18em] uppercase text-white/25 select-none">Spread</span>
+                <input
+                  type="range"
+                  min={0.3}
+                  max={5.0}
+                  step={0.05}
+                  value={spreadMultiplier}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    spreadMultiplierRef.current = v;
+                    setSpreadMultiplier(v);
+                  }}
+                  className="w-24 h-0.5 appearance-none bg-white/10 rounded-full outline-none cursor-pointer
+                    [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-2.5 [&::-webkit-slider-thumb]:h-2.5
+                    [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-orange-400
+                    [&::-webkit-slider-thumb]:border-0 [&::-webkit-slider-thumb]:cursor-pointer
+                    [&::-moz-range-thumb]:w-2.5 [&::-moz-range-thumb]:h-2.5
+                    [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-orange-400
+                    [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer"
+                />
+                <span className="text-[9px] font-mono text-white/25 w-6 text-left select-none">
+                  {spreadMultiplier.toFixed(1)}x
+                </span>
+              </div>
+            )}
             <p className="text-[10px] font-mono text-white/20 tracking-tight hover:text-white/40 transition-colors duration-300 cursor-default">
               &lt;/Shahnab&gt;
             </p>
